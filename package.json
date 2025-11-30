@@ -1,0 +1,15 @@
+{
+  "name": "ai-extension-debugger",
+  "version": "1.0.0",
+  "description": "AI-Driven Chrome Extension Auto-Testing & Auto-Fix System",
+  "scripts": {
+    "server": "cd debug-server && npm start",
+    "server:dev": "cd debug-server && npm run dev",
+    "mcp": "node mcp-server/index.js",
+    "all": "npm run server & npm run mcp",
+    "install:all": "npm install && cd debug-server && npm install && cd ../mcp-server && npm install",
+    "install:playwright": "cd mcp-server && npx playwright install chromium"
+  },
+  "keywords": ["chrome-extension", "testing", "automation", "ai", "mcp", "playwright"],
+  "license": "MIT"
+}
