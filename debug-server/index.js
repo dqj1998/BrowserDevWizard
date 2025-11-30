@@ -51,13 +51,54 @@ if (!fs.existsSync(COMMANDS_FILE)) {
 const PORT = 8123;
 const wss = new WebSocketServer({ port: PORT });
 let wsClient = null;
+let heartbeatInterval = null;
+let lastPongTime = Date.now();
 
-console.log(`🚀 AI Test Server running on ws://localhost:${PORT}`);
+// Heartbeat configuration
+const HEARTBEAT_INTERVAL = 15000; // Send ping every 15 seconds
+const HEARTBEAT_TIMEOUT = 30000;  // Consider dead if no pong for 30 seconds
+
+console.log(`🚀 BrowserDevWizard Server running on ws://localhost:${PORT}`);
 console.log(`📁 Data directory: ${DATA_DIR}`);
 console.log(`📁 Extension directory: ${EXTENSION_DIR}`);
 console.log(`📝 Commands file: ${COMMANDS_FILE}`);
 console.log('');
 console.log('Waiting for Chrome Extension to connect...');
+
+// Start heartbeat mechanism
+function startHeartbeat(ws) {
+  stopHeartbeat();
+  lastPongTime = Date.now();
+  
+  heartbeatInterval = setInterval(() => {
+    if (!ws || ws.readyState !== 1) {
+      stopHeartbeat();
+      return;
+    }
+    
+    // Check if we've received a pong recently
+    if (Date.now() - lastPongTime > HEARTBEAT_TIMEOUT) {
+      console.log('💔 Connection timeout - no heartbeat response');
+      ws.terminate();
+      stopHeartbeat();
+      return;
+    }
+    
+    // Send ping
+    try {
+      ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+    } catch (e) {
+      console.error('Failed to send ping:', e);
+    }
+  }, HEARTBEAT_INTERVAL);
+}
+
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
 
 // ===== Express HTTP API =====
 const HTTP_PORT = 8124;
@@ -90,6 +131,122 @@ app.get('/state', (req, res) => {
   }
 });
 
+// POST /refresh-dom - Request fresh DOM snapshot from the browser and wait for result
+app.post('/refresh-dom', async (req, res) => {
+  const { timeout = 5000 } = req.body || {};
+  
+  if (!wsClient || wsClient.readyState !== 1) {
+    return res.status(503).json({ error: 'Extension not connected' });
+  }
+  
+  // Get the current DOM timestamp before requesting
+  let beforeTimestamp = null;
+  try {
+    const currentDom = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'dom-snapshot.json'), 'utf8'));
+    beforeTimestamp = currentDom.timestamp;
+  } catch (e) {}
+  
+  // Request fresh DOM
+  wsClient.send(JSON.stringify({ type: 'request_dom' }));
+  
+  // Wait for DOM to be updated (check for timestamp change)
+  const startTime = Date.now();
+  const checkInterval = 100;
+  
+  const waitForNewDom = () => {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (Date.now() - startTime > timeout) {
+          reject(new Error('Timeout waiting for fresh DOM'));
+          return;
+        }
+        
+        try {
+          const newDom = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'dom-snapshot.json'), 'utf8'));
+          // Check if timestamp is newer
+          if (newDom.timestamp && newDom.timestamp !== beforeTimestamp) {
+            resolve(newDom);
+            return;
+          }
+        } catch (e) {}
+        
+        setTimeout(check, checkInterval);
+      };
+      check();
+    });
+  };
+  
+  try {
+    const dom = await waitForNewDom();
+    res.json({ success: true, dom });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /refresh-state - Request fresh DOM and screenshot from the browser
+app.post('/refresh-state', async (req, res) => {
+  const { timeout = 5000 } = req.body || {};
+  
+  if (!wsClient || wsClient.readyState !== 1) {
+    return res.status(503).json({ error: 'Extension not connected' });
+  }
+  
+  // Get timestamps before requesting
+  let beforeDomTimestamp = null;
+  let beforeScreenshotTimestamp = null;
+  try {
+    const currentDom = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'dom-snapshot.json'), 'utf8'));
+    beforeDomTimestamp = currentDom.timestamp;
+  } catch (e) {}
+  try {
+    const currentScreenshot = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'screenshot.json'), 'utf8'));
+    beforeScreenshotTimestamp = currentScreenshot.timestamp;
+  } catch (e) {}
+  
+  // Request fresh DOM and screenshot
+  wsClient.send(JSON.stringify({ type: 'request_dom' }));
+  wsClient.send(JSON.stringify({ type: 'capture_screenshot' }));
+  
+  const startTime = Date.now();
+  const checkInterval = 100;
+  
+  const waitForNewState = () => {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (Date.now() - startTime > timeout) {
+          reject(new Error('Timeout waiting for fresh state'));
+          return;
+        }
+        
+        try {
+          const newDom = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'dom-snapshot.json'), 'utf8'));
+          const newScreenshot = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'screenshot.json'), 'utf8'));
+          
+          // Check if both are updated
+          const domUpdated = newDom.timestamp && newDom.timestamp !== beforeDomTimestamp;
+          const screenshotUpdated = newScreenshot.timestamp && newScreenshot.timestamp !== beforeScreenshotTimestamp;
+          
+          if (domUpdated && screenshotUpdated) {
+            resolve({ dom: newDom, screenshot: newScreenshot });
+            return;
+          }
+        } catch (e) {}
+        
+        setTimeout(check, checkInterval);
+      };
+      check();
+    });
+  };
+  
+  try {
+    const state = await waitForNewState();
+    res.json({ success: true, ...state });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // GET /data/:file - Get specific data file
 app.get('/data/:file', (req, res) => {
   const validFiles = ['dom-snapshot.json', 'console-logs.json', 'screenshot.json', 'events.json'];
@@ -102,6 +259,63 @@ app.get('/data/:file', (req, res) => {
   try {
     const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /console - Get all console logs with filtering options
+app.get('/console', (req, res) => {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'console-logs.json'), 'utf8'));
+    const logs = data.logs || [];
+    
+    // Filter by method if specified
+    const methods = req.query.methods ? req.query.methods.split(',') : null;
+    const limit = req.query.limit ? parseInt(req.query.limit) : null;
+    const since = req.query.since ? parseInt(req.query.since) : null;
+    
+    let filteredLogs = logs;
+    
+    // Filter by method type (log, error, warn, info, debug)
+    if (methods) {
+      filteredLogs = filteredLogs.filter(l => methods.includes(l.method));
+    }
+    
+    // Filter by timestamp
+    if (since) {
+      filteredLogs = filteredLogs.filter(l => l.timestamp > since);
+    }
+    
+    // Limit results
+    if (limit && limit > 0) {
+      filteredLogs = filteredLogs.slice(-limit);
+    }
+    
+    // Calculate stats
+    const stats = {
+      total: filteredLogs.length,
+      byMethod: {}
+    };
+    for (const log of filteredLogs) {
+      stats.byMethod[log.method] = (stats.byMethod[log.method] || 0) + 1;
+    }
+    
+    res.json({
+      logs: filteredLogs,
+      stats,
+      filters: { methods, limit, since }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /console - Clear console logs
+app.delete('/console', (req, res) => {
+  try {
+    fs.writeFileSync(path.join(DATA_DIR, 'console-logs.json'), JSON.stringify({ logs: [] }, null, 2));
+    res.json({ success: true, message: 'Console logs cleared' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -179,6 +393,78 @@ app.post('/execute', async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, error: error.message, commandId });
   }
+});
+
+// POST /navigate - Navigate to URL using extension
+app.post('/navigate', async (req, res) => {
+  const { url, timeout = 30000 } = req.body;
+  
+  if (!wsClient || wsClient.readyState !== 1) {
+    return res.status(503).json({ error: 'Extension not connected. Please open Chrome with the extension installed.' });
+  }
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  
+  const commandId = ++commandIdCounter;
+  
+  // Create promise for navigation result
+  const resultPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingCommands.delete(commandId);
+      reject(new Error('Navigation timeout'));
+    }, timeout);
+    
+    pendingCommands.set(commandId, { resolve, reject, timer });
+  });
+  
+  // Send navigate command
+  wsClient.send(JSON.stringify({ type: 'navigate', url, commandId }));
+  
+  try {
+    const result = await resultPromise;
+    res.json({ success: true, result, commandId });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message, commandId });
+  }
+});
+
+// GET /tab - Get current tab info
+app.get('/tab', async (req, res) => {
+  if (!wsClient || wsClient.readyState !== 1) {
+    return res.status(503).json({ error: 'Extension not connected' });
+  }
+  
+  const commandId = ++commandIdCounter;
+  
+  const resultPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingCommands.delete(commandId);
+      reject(new Error('Timeout getting tab info'));
+    }, 5000);
+    
+    pendingCommands.set(commandId, { resolve, reject, timer });
+  });
+  
+  wsClient.send(JSON.stringify({ type: 'get_tab_info', commandId }));
+  
+  try {
+    const result = await resultPromise;
+    res.json({ success: true, ...result.result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /reload-extension - Reload the browser extension
+app.post('/reload-extension', (req, res) => {
+  if (!wsClient || wsClient.readyState !== 1) {
+    return res.status(503).json({ error: 'Extension not connected' });
+  }
+  
+  wsClient.send(JSON.stringify({ type: 'reload_extension' }));
+  res.json({ success: true, message: 'Extension reload command sent' });
 });
 
 // POST /capture - Trigger capture-all and return session data
@@ -289,6 +575,9 @@ wss.on('connection', (ws) => {
   console.log('');
   console.log('✅ Chrome Extension connected!');
   console.log('');
+  
+  // Start heartbeat mechanism
+  startHeartbeat(ws);
 
   ws.on('message', (raw) => {
     try {
@@ -301,11 +590,13 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('❌ Chrome Extension disconnected');
+    stopHeartbeat();
     wsClient = null;
   });
 
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
+    stopHeartbeat();
   });
 });
 
@@ -314,8 +605,14 @@ function handleMessage(msg) {
   const timestamp = new Date().toISOString();
 
   switch (msg.type) {
+    case 'pong':
+      // Update last pong time for heartbeat
+      lastPongTime = Date.now();
+      break;
+      
     case 'extension_ready':
       console.log(`[${timestamp}] Extension ready`);
+      lastPongTime = Date.now(); // Reset pong time on reconnect
       // Process any pending commands
       processPendingCommands();
       break;

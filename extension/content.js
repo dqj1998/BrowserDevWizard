@@ -1,4 +1,4 @@
-// AI Test Bridge - Content Script
+// Browser Dev Bridge - Content Script
 // Runs in the context of web pages
 
 (function() {
@@ -37,6 +37,102 @@
     };
   });
 
+  // ===== JavaScript Execution with CSP Fallbacks =====
+  // Execute JavaScript code with multiple fallback strategies for CSP-restricted pages
+  async function executeJS(code, commandId) {
+    // Strategy 1: Try Function constructor (works in most cases, bypasses eval restrictions)
+    try {
+      const fn = new Function('return (' + code + ')');
+      const result = fn();
+      return result;
+    } catch (e1) {
+      // If Function constructor fails (due to CSP), try fallback strategies
+      console.log('[AI Bridge] Function constructor failed, trying script injection:', e1.message);
+    }
+
+    // Strategy 2: Script element injection (works if 'unsafe-inline' is allowed or no script-src)
+    try {
+      return await new Promise((resolve, reject) => {
+        const resultKey = '__aibridge_result_' + commandId;
+        const errorKey = '__aibridge_error_' + commandId;
+        
+        const script = document.createElement('script');
+        script.textContent = `
+          try {
+            window['${resultKey}'] = (function() { return (${code}); })();
+          } catch (e) {
+            window['${errorKey}'] = e.message;
+          }
+        `;
+        document.documentElement.appendChild(script);
+        script.remove();
+        
+        // Check for result or error
+        if (window[errorKey]) {
+          const error = window[errorKey];
+          delete window[resultKey];
+          delete window[errorKey];
+          reject(new Error(error));
+        } else {
+          const result = window[resultKey];
+          delete window[resultKey];
+          delete window[errorKey];
+          resolve(result);
+        }
+      });
+    } catch (e2) {
+      console.log('[AI Bridge] Script injection failed, trying external blob:', e2.message);
+    }
+
+    // Strategy 3: Blob URL script (works if blob: is allowed in script-src)
+    try {
+      return await new Promise((resolve, reject) => {
+        const resultKey = '__aibridge_result_' + commandId;
+        const errorKey = '__aibridge_error_' + commandId;
+        
+        const blob = new Blob([`
+          try {
+            window['${resultKey}'] = (function() { return (${code}); })();
+          } catch (e) {
+            window['${errorKey}'] = e.message;
+          }
+        `], { type: 'application/javascript' });
+        
+        const url = URL.createObjectURL(blob);
+        const script = document.createElement('script');
+        script.src = url;
+        
+        script.onload = () => {
+          URL.revokeObjectURL(url);
+          script.remove();
+          
+          if (window[errorKey]) {
+            const error = window[errorKey];
+            delete window[resultKey];
+            delete window[errorKey];
+            reject(new Error(error));
+          } else {
+            const result = window[resultKey];
+            delete window[resultKey];
+            delete window[errorKey];
+            resolve(result);
+          }
+        };
+        
+        script.onerror = () => {
+          URL.revokeObjectURL(url);
+          script.remove();
+          reject(new Error('Blob script injection blocked by CSP'));
+        };
+        
+        document.documentElement.appendChild(script);
+      });
+    } catch (e3) {
+      // All strategies failed - CSP is too restrictive
+      throw new Error(`CSP blocks JavaScript execution. Tried: Function constructor, inline script, blob script. Page CSP is too restrictive. Error: ${e3.message}`);
+    }
+  }
+
   // ===== Error Capture =====
   window.addEventListener('error', (event) => {
     try {
@@ -68,6 +164,7 @@
       chrome.runtime.sendMessage({
         type: "dom_snapshot",
         html,
+        url: window.location.href,  // Include URL from content script's context
         captureAll: msg.captureAll || false,
         timestamp: msg.timestamp
       });
@@ -133,21 +230,22 @@
     }
 
     // Execute arbitrary JavaScript
+    // Uses multiple fallback strategies to handle CSP restrictions
     if (msg.action === "run_js") {
-      try {
-        const result = eval(msg.code);
+      executeJS(msg.code, msg.commandId).then(result => {
         chrome.runtime.sendMessage({
           type: "event",
           event: { action: "run_js", code: msg.code, success: true, result: String(result), commandId: msg.commandId }
         });
         sendResponse({ ok: true, result });
-      } catch (e) {
+      }).catch(e => {
         chrome.runtime.sendMessage({
           type: "event",
           event: { action: "run_js", code: msg.code, success: false, error: e.message, commandId: msg.commandId }
         });
         sendResponse({ ok: false, error: e.message });
-      }
+      });
+      return true; // Keep message channel open for async response
     }
 
     // Navigate to URL

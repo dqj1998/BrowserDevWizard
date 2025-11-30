@@ -37,6 +37,108 @@ const server = new McpServer({
 
 // ===== TOOLS =====
 
+// Tool: get_browser_status
+server.tool(
+  'get_browser_status',
+  'Check if a browser is connected via the extension.',
+  {},
+  async () => {
+    try {
+      const status = await callDebugServer('/status');
+      
+      if (status.connected) {
+        const tabInfo = await callDebugServer('/tab');
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              connected: true,
+              currentUrl: tabInfo.url || 'unknown',
+              currentTitle: tabInfo.title || 'unknown',
+              message: 'Browser connected via extension. Ready for commands.'
+            }, null, 2)
+          }]
+        };
+      } else {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              connected: false,
+              message: 'No browser connected. Either:\n1. Use connect_browser to wait for an existing Chrome with the extension\n2. Use launch_browser to start a new browser with Playwright'
+            }, null, 2)
+          }]
+        };
+      }
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ connected: false, error: error.message }, null, 2)
+        }]
+      };
+    }
+  }
+);
+
+// Tool: connect_browser
+server.tool(
+  'connect_browser',
+  'Wait for an existing Chrome browser with the extension to connect. Use this when you want to control a browser you opened manually (with all your logins). Start Chrome normally with the extension installed, then call this tool.',
+  {
+    timeout: z.number().optional().describe('Timeout in seconds to wait for connection (default: 30)')
+  },
+  async ({ timeout = 30 }) => {
+    try {
+      const startTime = Date.now();
+      const timeoutMs = timeout * 1000;
+      
+      // Poll for connection
+      while (Date.now() - startTime < timeoutMs) {
+        const status = await callDebugServer('/status');
+        if (status.connected) {
+          // Get current tab info
+          const tabInfo = await callDebugServer('/tab');
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                connected: true,
+                currentUrl: tabInfo.url || 'unknown',
+                currentTitle: tabInfo.title || 'unknown',
+                message: 'Connected to existing Chrome browser via extension. You can now use navigate, execute_action, and capture_state tools.'
+              }, null, 2)
+            }]
+          };
+        }
+        // Wait 1 second before checking again
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            connected: false,
+            message: 'Timeout waiting for browser connection. Please ensure:\n1. Chrome is open\n2. The BrowserDevWizard extension is installed and enabled\n3. The debug-server is running (npm run debug-server)'
+          }, null, 2)
+        }],
+        isError: true
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: false, error: error.message }, null, 2)
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
 // Tool: launch_browser
 server.tool(
   'launch_browser',
@@ -90,16 +192,53 @@ server.tool(
 // Tool: navigate
 server.tool(
   'navigate',
-  'Navigate to a URL in the browser. Waits for page load.',
+  'Navigate to a URL in the browser. Uses the extension connection by default, falls back to Playwright if extension not connected.',
   {
     url: z.string().describe('URL to navigate to'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).optional()
-      .describe('When to consider navigation complete (default: domcontentloaded)')
+      .describe('When to consider navigation complete (default: domcontentloaded)'),
+    usePlaywright: z.boolean().optional().describe('Force using Playwright instead of extension (default: false)')
   },
-  async ({ url, waitUntil }) => {
-    const browser = getBrowserManager();
-    
+  async ({ url, waitUntil, usePlaywright = false }) => {
     try {
+      // First try using the extension (works with existing browser)
+      if (!usePlaywright) {
+        const status = await callDebugServer('/status');
+        if (status.connected) {
+          const result = await callDebugServer('/navigate', {
+            method: 'POST',
+            body: JSON.stringify({ url })
+          });
+          
+          if (result.success) {
+            // Wait for page to stabilize then request fresh DOM
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Trigger a fresh DOM capture to update the cache
+            await callDebugServer('/refresh-dom', {
+              method: 'POST',
+              body: JSON.stringify({ timeout: 5000 })
+            });
+            
+            // Get tab info after navigation
+            const tabInfo = await callDebugServer('/tab');
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: true,
+                  url: tabInfo.url || url,
+                  title: tabInfo.title || '',
+                  method: 'extension'
+                }, null, 2)
+              }]
+            };
+          }
+        }
+      }
+      
+      // Fall back to Playwright
+      const browser = getBrowserManager();
       const result = await browser.navigate(url, { waitUntil });
       return {
         content: [{
@@ -107,7 +246,8 @@ server.tool(
           text: JSON.stringify({
             success: true,
             url: result.url,
-            title: result.title
+            title: result.title,
+            method: 'playwright'
           }, null, 2)
         }]
       };
@@ -237,13 +377,29 @@ server.tool(
 // Tool: get_state
 server.tool(
   'get_state',
-  'Get current browser state without saving a capture session. Returns DOM, console logs, and events.',
+  'Get current browser state. By default requests fresh data from the browser. Returns DOM, console logs, and events.',
   {
-    includeScreenshot: z.boolean().optional().describe('Include screenshot data (can be large)')
+    includeScreenshot: z.boolean().optional().describe('Include screenshot data (can be large)'),
+    fresh: z.boolean().optional().describe('Request fresh state from browser (default: true). Set to false to use cached data.')
   },
-  async ({ includeScreenshot }) => {
+  async ({ includeScreenshot, fresh = true }) => {
     try {
-      const state = await callDebugServer('/state');
+      let state;
+      
+      // Request fresh state from browser if requested
+      if (fresh) {
+        const refreshResult = await callDebugServer('/refresh-dom', {
+          method: 'POST',
+          body: JSON.stringify({ timeout: 5000 })
+        });
+        
+        if (refreshResult.error && !refreshResult.error.includes('Timeout')) {
+          // If refresh fails (not just timeout), fall back to cached
+          console.error('Failed to refresh DOM, using cached:', refreshResult.error);
+        }
+      }
+      
+      state = await callDebugServer('/state');
       
       if (state.error) {
         throw new Error(state.error);
@@ -407,15 +563,126 @@ server.tool(
   }
 );
 
+// Tool: get_console_logs
+server.tool(
+  'get_console_logs',
+  'Get all console messages (log, info, warn, debug, error) - not just errors. Use this to see full console output including console.log statements.',
+  {
+    methods: z.array(z.enum(['log', 'info', 'warn', 'debug', 'error'])).optional()
+      .describe('Filter by console method types (default: all types)'),
+    limit: z.number().optional().describe('Maximum number of log entries to return (default: 100)'),
+    since: z.number().optional().describe('Only return logs after this timestamp (ms since epoch)'),
+    session: z.string().optional().describe('Session name (uses current state if not provided)')
+  },
+  async ({ methods, limit = 100, since, session }) => {
+    try {
+      let result;
+      
+      if (session) {
+        // Get from session
+        const data = await callDebugServer(`/session/${session}`);
+        if (data.error) throw new Error(data.error);
+        
+        let logs = data.console_logs?.logs || [];
+        
+        // Apply filters manually for session data
+        if (methods && methods.length > 0) {
+          logs = logs.filter(l => methods.includes(l.method));
+        }
+        if (since) {
+          logs = logs.filter(l => l.timestamp > since);
+        }
+        if (limit > 0) {
+          logs = logs.slice(-limit);
+        }
+        
+        // Calculate stats
+        const stats = { total: logs.length, byMethod: {} };
+        for (const log of logs) {
+          stats.byMethod[log.method] = (stats.byMethod[log.method] || 0) + 1;
+        }
+        
+        result = { logs, stats, filters: { methods, limit, since } };
+      } else {
+        // Use the /console endpoint with query params
+        const params = new URLSearchParams();
+        if (methods && methods.length > 0) params.set('methods', methods.join(','));
+        if (limit) params.set('limit', limit.toString());
+        if (since) params.set('since', since.toString());
+        
+        result = await callDebugServer(`/console?${params.toString()}`);
+        if (result.error) throw new Error(result.error);
+      }
+      
+      // Format logs for AI consumption
+      const formattedLogs = result.logs.map(log => ({
+        method: log.method,
+        message: log.args?.join(' ') || '',
+        timestamp: new Date(log.timestamp).toISOString(),
+        url: log.url
+      }));
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            totalLogs: result.stats?.total || formattedLogs.length,
+            stats: result.stats?.byMethod || {},
+            logs: formattedLogs
+          }, null, 2)
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: false, error: error.message }, null, 2)
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool: clear_console_logs
+server.tool(
+  'clear_console_logs',
+  'Clear all captured console logs. Useful before performing an action to get clean logs.',
+  {},
+  async () => {
+    try {
+      const result = await callDebugServer('/console', { method: 'DELETE' });
+      
+      if (result.error) throw new Error(result.error);
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: true, message: 'Console logs cleared' }, null, 2)
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: false, error: error.message }, null, 2)
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
 // Tool: get_dom
 server.tool(
   'get_dom',
-  'Get the current DOM HTML content. Use sparingly as it can be large.',
+  'Get the current DOM HTML content. By default requests fresh DOM from the browser. Use sparingly as it can be large.',
   {
     session: z.string().optional().describe('Session name (uses current state if not provided)'),
-    maxLength: z.number().optional().describe('Maximum HTML length to return (default: 50000)')
+    maxLength: z.number().optional().describe('Maximum HTML length to return (default: 50000)'),
+    fresh: z.boolean().optional().describe('Request fresh DOM from browser (default: true). Set to false to use cached data.')
   },
-  async ({ session, maxLength = 50000 }) => {
+  async ({ session, maxLength = 50000, fresh = true }) => {
     try {
       let dom;
       
@@ -424,9 +691,26 @@ server.tool(
         if (data.error) throw new Error(data.error);
         dom = data.dom_snapshot;
       } else {
-        const state = await callDebugServer('/data/dom-snapshot.json');
-        if (state.error) throw new Error(state.error);
-        dom = state;
+        // Request fresh DOM if not using a session
+        if (fresh) {
+          const refreshResult = await callDebugServer('/refresh-dom', {
+            method: 'POST',
+            body: JSON.stringify({ timeout: 5000 })
+          });
+          
+          if (refreshResult.success && refreshResult.dom) {
+            dom = refreshResult.dom;
+          } else {
+            // Fall back to cached if refresh fails
+            const state = await callDebugServer('/data/dom-snapshot.json');
+            if (state.error) throw new Error(state.error);
+            dom = state;
+          }
+        } else {
+          const state = await callDebugServer('/data/dom-snapshot.json');
+          if (state.error) throw new Error(state.error);
+          dom = state;
+        }
       }
       
       let html = dom.html || '';

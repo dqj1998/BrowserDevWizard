@@ -1,29 +1,126 @@
-// AI Test Bridge - Background Service Worker
+// Browser Dev Bridge - Background Service Worker
 // Maintains WebSocket connection to local AI server
 
 let ws = null;
 let isConnected = false;
+let heartbeatInterval = null;
+let reconnectTimeout = null;
+let keepAliveInterval = null;
+
+// Heartbeat configuration
+const HEARTBEAT_INTERVAL = 15000; // Send heartbeat every 15 seconds
+const RECONNECT_DELAY = 3000;     // Reconnect after 3 seconds
+const KEEPALIVE_INTERVAL = 20000; // Keep service worker alive every 20 seconds
+
+// Update icon badge to show connection status
+function updateConnectionBadge(connected) {
+  if (connected) {
+    // Green dot for connected
+    chrome.action.setBadgeText({ text: "●" });
+    chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
+    chrome.action.setTitle({ title: "BrowserDevBridge - Connected" });
+  } else {
+    // Red dot for disconnected
+    chrome.action.setBadgeText({ text: "●" });
+    chrome.action.setBadgeBackgroundColor({ color: "#F44336" });
+    chrome.action.setTitle({ title: "BrowserDevBridge - Disconnected" });
+  }
+}
+
+// Start heartbeat to keep connection alive
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+      } catch (e) {
+        console.error('[AI Bridge] Failed to send heartbeat:', e);
+      }
+    }
+  }, HEARTBEAT_INTERVAL);
+}
+
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
+
+// Keep service worker alive (Manifest V3 workaround)
+function startKeepAlive() {
+  stopKeepAlive();
+  keepAliveInterval = setInterval(() => {
+    // Simple operation to keep service worker active
+    chrome.runtime.getPlatformInfo(() => {});
+  }, KEEPALIVE_INTERVAL);
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
+// Schedule reconnection
+function scheduleReconnect() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+  }
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    connect();
+  }, RECONNECT_DELAY);
+}
 
 // Connect to the AI test server
 function connect() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    console.log("[AI Bridge] Already connected");
+  // Clear any pending reconnect
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+  
+  // Close existing connection if any
+  if (ws) {
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      console.log("[AI Bridge] Closing existing connection");
+      ws.close();
+    }
+    ws = null;
+  }
+
+  console.log("[AI Bridge] Connecting to AI server...");
+  
+  try {
+    ws = new WebSocket("ws://localhost:8123");
+  } catch (e) {
+    console.error("[AI Bridge] Failed to create WebSocket:", e);
+    scheduleReconnect();
     return;
   }
 
-  ws = new WebSocket("ws://localhost:8123");
-
   ws.onopen = () => {
     isConnected = true;
+    updateConnectionBadge(true);
     console.log("[AI Bridge] Connected to AI server");
     ws.send(JSON.stringify({ type: "extension_ready", timestamp: Date.now() }));
+    
+    // Start heartbeat to keep connection alive
+    startHeartbeat();
+    startKeepAlive();
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     isConnected = false;
-    console.log("[AI Bridge] Disconnected from AI server");
-    // Auto-reconnect after 3 seconds
-    setTimeout(connect, 3000);
+    updateConnectionBadge(false);
+    stopHeartbeat();
+    console.log("[AI Bridge] Disconnected from AI server (code:", event.code, ")");
+    
+    // Auto-reconnect
+    scheduleReconnect();
   };
 
   ws.onerror = (error) => {
@@ -32,12 +129,72 @@ function connect() {
 
   ws.onmessage = async (evt) => {
     const msg = JSON.parse(evt.data);
+    
+    // Handle ping silently (heartbeat)
+    if (msg.type === "ping") {
+      ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+      return;
+    }
+    
     console.log("[AI Bridge] Received:", msg);
 
     // Reload extension command
     if (msg.type === "reload_extension") {
       console.log("[AI Bridge] Reloading extension...");
       chrome.runtime.reload();
+    }
+
+    // Navigate to URL using Chrome tabs API
+    if (msg.type === "navigate" || msg.action === "navigate") {
+      const url = msg.url;
+      const commandId = msg.commandId;
+      console.log("[AI Bridge] Navigating to:", url);
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab) {
+          await chrome.tabs.update(tab.id, { url });
+          // Wait for page to load
+          chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
+            if (tabId === tab.id && info.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(listener);
+              ws.send(JSON.stringify({
+                type: "command_result",
+                commandId,
+                success: true,
+                result: { url, action: "navigate" }
+              }));
+            }
+          });
+        }
+      } catch (error) {
+        ws.send(JSON.stringify({
+          type: "command_result",
+          commandId,
+          success: false,
+          error: error.message
+        }));
+      }
+    }
+
+    // Get current tab info
+    if (msg.type === "get_tab_info") {
+      const commandId = msg.commandId;
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        ws.send(JSON.stringify({
+          type: "command_result",
+          commandId,
+          success: true,
+          result: { url: tab?.url, title: tab?.title, id: tab?.id }
+        }));
+      } catch (error) {
+        ws.send(JSON.stringify({
+          type: "command_result",
+          commandId,
+          success: false,
+          error: error.message
+        }));
+      }
     }
 
     // Execute command in content script
@@ -160,7 +317,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       ws.send(JSON.stringify({
         type: msg.captureAll ? "dom_snapshot_all" : "dom_snapshot",
         html: msg.html,
-        url: sender.tab?.url,
+        url: msg.url || sender.tab?.url,  // Prefer URL from message, fallback to sender.tab
         timestamp: msg.timestamp || Date.now()
       }));
     }
@@ -180,7 +337,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Handle popup requests
   if (msg.type === "get_status") {
-    sendResponse({ connected: isConnected });
+    // Check actual WebSocket state, not just the isConnected variable
+    const actuallyConnected = ws && ws.readyState === WebSocket.OPEN;
+    // Sync the variable if it's out of sync
+    if (isConnected !== actuallyConnected) {
+      isConnected = actuallyConnected;
+      updateConnectionBadge(isConnected);
+    }
+    sendResponse({ connected: actuallyConnected });
   }
 
   if (msg.type === "connect") {
@@ -209,6 +373,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   return true; // Keep message channel open for async responses
 });
+
+// Initialize badge to disconnected state
+updateConnectionBadge(false);
 
 // Auto-connect on startup
 connect();

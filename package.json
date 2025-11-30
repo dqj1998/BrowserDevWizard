@@ -1,7 +1,7 @@
 {
-  "name": "ai-extension-debugger",
+  "name": "dev-on-browser-debugger",
   "version": "1.0.0",
-  "description": "AI-Driven Chrome Extension Auto-Testing & Auto-Fix System",
+  "description": "Auto-Testing & Auto-Fix System for dev on Browsers with AI assistance",
   "scripts": {
     "server": "cd debug-server && npm start",
     "server:dev": "cd debug-server && npm run dev",

@@ -65,6 +65,7 @@ class BrowserManager {
     if (useExistingSession) {
       dataDir = userDataDir || getDefaultChromeUserDataDir();
       console.log(`🔐 Using existing Chrome session from: ${dataDir}`);
+      console.log(`⚠️  Note: Close your regular Chrome browser first if using existing session!`);
     }
 
     console.log(`🚀 Launching Chrome with extension: ${EXTENSION_PATH}`);
@@ -78,18 +79,35 @@ class BrowserManager {
     ];
 
     // Add profile directory if using existing session
-    if (useExistingSession && profileName && profileName !== 'Default') {
+    if (useExistingSession && profileName) {
       launchArgs.push(`--profile-directory=${profileName}`);
     }
 
-    // Launch Chrome with extension
-    this.context = await chromium.launchPersistentContext(dataDir, {
+    // Launch options
+    const launchOptions = {
       headless: false, // Extensions don't work in headless
       args: launchArgs,
-      viewport: { width, height },
-      // Ignore default args that might interfere with existing session
-      ignoreDefaultArgs: useExistingSession ? ['--disable-extensions'] : []
-    });
+      viewport: { width, height }
+    };
+
+    // Use actual Chrome browser (not Chromium) for existing sessions
+    if (useExistingSession) {
+      launchOptions.channel = 'chrome';
+      launchOptions.ignoreDefaultArgs = ['--disable-extensions', '--enable-automation'];
+    }
+
+    console.log(`📁 User data dir: ${dataDir || '(temporary)'}`);
+    console.log(`🔧 Launch args:`, launchArgs);
+
+    // Launch Chrome with extension
+    try {
+      this.context = await chromium.launchPersistentContext(dataDir, launchOptions);
+    } catch (error) {
+      if (error.message.includes('lock') || error.message.includes('already in use') || error.message.includes('user data directory')) {
+        throw new Error(`Cannot use existing Chrome session - Chrome may already be running. Please close Chrome first, or set useExistingSession: false. Original error: ${error.message}`);
+      }
+      throw error;
+    }
 
     // Get the first page or create one
     const pages = this.context.pages();
