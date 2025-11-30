@@ -206,7 +206,7 @@ Add to VS Code settings.json (`Cmd+,` → "Edit in settings.json"):
 The AI can run an automated loop:
 
 ```
-1. launch_browser(url) → Start Chrome with extension
+1. connect_browser or launch_browser(url) → Start Chrome with extension
 2. capture_state("before") → Save initial state
 3. execute_action({click/type/run_js}) → Interact with page
 4. capture_state("after") → Save new state
