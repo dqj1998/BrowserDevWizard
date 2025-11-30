@@ -8,23 +8,34 @@ A system where VSCode + Copilot can observe a live Chrome browser, inspect DOM, 
 ┌─────────────────┐     WebSocket      ┌─────────────────┐
 │ Chrome Extension│◄──────────────────►│  Debug Server   │
 │  (background +  │    ws://localhost  │   (Node.js)     │
-│  content scripts)│       :8123       │                 │
-└─────────────────┘                    └────────┬────────┘
-                                                │
-                                                │ Writes JSON
-                                                ▼
-                                       ┌─────────────────┐
-                                       │  /data/*.json   │
-                                       │  (DOM, Console, │
-                                       │   Screenshots)  │
-                                       └────────┬────────┘
-                                                │
-                                                │ Read by
-                                                ▼
-                                       ┌─────────────────┐
-                                       │ VSCode + Copilot│
-                                       │  (You + AI)     │
-                                       └─────────────────┘
+│  content scripts)│       :8123       │   :8124 HTTP    │
+└────────┬────────┘                    └────────┬────────┘
+         │                                      │
+         │ Executes                             │ Writes JSON
+         │ (click/type/run_js)                  ▼
+         │                             ┌─────────────────┐
+         │                             │  /data/*.json   │
+         │                             │  (DOM, Console, │
+         │                             │   Screenshots)  │
+         │                             └────────┬────────┘
+         │                                      │
+         │         ┌────────────────────────────┘
+         │         │ Read by
+         │         ▼
+         │ ┌─────────────────┐
+         │ │ VSCode + Copilot│
+         │ │  (You + AI)     │
+         │ └────────┬────────┘
+         │          │
+         │          │ Sends commands via:
+         │          │ • commands.json (file watch)
+         │          │ • HTTP POST /execute
+         │          │ • MCP tools (execute_action)
+         │          ▼
+         │ ┌─────────────────┐
+         └─┤  Debug Server   │──► WebSocket ──► Extension
+           │  (relays cmd)   │
+           └─────────────────┘
 ```
 
 ## Setup
