@@ -25,6 +25,11 @@ function updateConnectionBadge(connected) {
     chrome.action.setBadgeBackgroundColor({ color: "#F44336" });
     chrome.action.setTitle({ title: "BrowserDevBridge - Disconnected" });
   }
+  
+  // Notify popup about connection status change
+  chrome.runtime.sendMessage({ type: 'connection_status_changed', connected }).catch(() => {
+    // Ignore errors when popup is not open
+  });
 }
 
 // Start heartbeat to keep connection alive
@@ -197,11 +202,326 @@ function connect() {
       }
     }
 
-    // Execute command in content script
+    // Execute JavaScript directly using chrome.scripting API (bypasses CSP)
+    if (msg.type === "execute" && msg.action === "run_js") {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab && tab.id) {
+        // Check if it's a restricted URL
+        if (tab.url && (tab.url.startsWith('chrome://') || tab.url.startsWith('edge://') || 
+            tab.url.startsWith('about:') || tab.url.startsWith('chrome-extension://') ||
+            tab.url.startsWith('moz-extension://') || tab.url.startsWith('extension://'))) {
+          ws.send(JSON.stringify({
+            type: "event",
+            event: {
+              action: "run_js",
+              commandId: msg.commandId,
+              success: false,
+              error: `Cannot execute on restricted page: ${tab.url}. Navigate to a regular web page first.`
+            },
+            url: tab.url,
+            timestamp: Date.now()
+          }));
+          return;
+        }
+
+        try {
+          // Use chrome.scripting.executeScript to execute JavaScript
+          const code = msg.code;
+          
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',  // Execute in page's main world for full access
+            func: (codeToRun) => {
+              // Helper to format result
+              const formatResult = (result) => {
+                if (result === undefined) {
+                  return { success: true, result: 'undefined', wasUndefined: true };
+                } else if (result === null) {
+                  return { success: true, result: 'null' };
+                } else if (typeof result === 'object') {
+                  try {
+                    return { success: true, result: JSON.stringify(result, null, 2) };
+                  } catch (e) {
+                    return { success: true, result: String(result) };
+                  }
+                } else {
+                  return { success: true, result: String(result) };
+                }
+              };
+
+              const errors = [];
+
+              // Strategy 1: Try indirect eval first (works on most sites without strict CSP)
+              try {
+                const indirectEval = (0, eval);
+                const result = indirectEval('(' + codeToRun + ')');
+                return formatResult(result);
+              } catch (evalError) {
+                errors.push('eval: ' + evalError.message);
+              }
+
+              // Strategy 2: Try Function constructor
+              try {
+                const fn = new Function('return (' + codeToRun + ')');
+                const result = fn();
+                return formatResult(result);
+              } catch (fnError) {
+                errors.push('Function: ' + fnError.message);
+              }
+
+              // Strategy 3: Script element with Trusted Types (if available)
+              const resultKey = '__bdb_r_' + Math.random().toString(36).slice(2);
+              const errorKey = '__bdb_e_' + Math.random().toString(36).slice(2);
+              const scriptCode = `
+                try {
+                  window['${resultKey}'] = (function() { return (${codeToRun}); })();
+                } catch (e) {
+                  window['${errorKey}'] = e.message;
+                }
+              `;
+              
+              if (window.trustedTypes) {
+                try {
+                  // Create a unique policy (each call needs unique name)
+                  const policyName = 'bdb_' + Math.random().toString(36).slice(2);
+                  const policy = window.trustedTypes.createPolicy(policyName, {
+                    createScript: (s) => s
+                  });
+                  
+                  // Simpler approach: wrap in try-catch and set result directly
+                  const wrappedCode = `
+                    (function() {
+                      try {
+                        var __result = (${codeToRun});
+                        window['${resultKey}'] = __result;
+                      } catch (e) {
+                        window['${errorKey}'] = e.message;
+                      }
+                    })();
+                  `;
+                  
+                  const script = document.createElement('script');
+                  script.text = policy.createScript(wrappedCode);
+                  
+                  // Try appending to head first, then documentElement
+                  (document.head || document.documentElement).appendChild(script);
+                  script.remove();
+                  
+                  // Check for error first
+                  const hasError = Object.prototype.hasOwnProperty.call(window, errorKey);
+                  const hasResult = Object.prototype.hasOwnProperty.call(window, resultKey);
+                  
+                  if (hasError) {
+                    const error = window[errorKey];
+                    try { delete window[resultKey]; } catch(e) {}
+                    try { delete window[errorKey]; } catch(e) {}
+                    return { success: false, error: error };
+                  }
+                  
+                  if (hasResult) {
+                    const result = window[resultKey];
+                    try { delete window[resultKey]; } catch(e) {}
+                    try { delete window[errorKey]; } catch(e) {}
+                    return formatResult(result);
+                  }
+                  
+                  errors.push('TrustedTypes: policy created but script did not set result (CSP may block script execution)');
+                } catch (ttError) {
+                  errors.push('TrustedTypes: ' + ttError.message);
+                }
+              }
+              
+              // Strategy 4: Plain inline script (for sites without Trusted Types)
+              try {
+                const script = document.createElement('script');
+                script.textContent = scriptCode;
+                document.documentElement.appendChild(script);
+                script.remove();
+                
+                if (window[errorKey]) {
+                  const error = window[errorKey];
+                  delete window[resultKey];
+                  delete window[errorKey];
+                  return { success: false, error: error };
+                }
+                
+                const result = window[resultKey];
+                const wasSet = resultKey in window || result !== undefined;
+                delete window[resultKey];
+                delete window[errorKey];
+                
+                if (wasSet) {
+                  return formatResult(result);
+                }
+                errors.push('inline: script did not execute (CSP blocked)');
+              } catch (inlineError) {
+                errors.push('inline: ' + inlineError.message);
+              }
+              
+              return { 
+                success: false, 
+                error: 'All methods blocked by strict CSP: ' + errors.join('; ') + '. This site has very strict security policies. Try using usePlaywright:true for DOM access, or use get_state to read the page content.',
+                cspBlocked: true
+              };
+            },
+            args: [code]
+          });
+
+          const result = results[0]?.result;
+          if (result?.success) {
+            ws.send(JSON.stringify({
+              type: "event",
+              event: {
+                action: "run_js",
+                code: code,
+                success: true,
+                result: result.result,
+                commandId: msg.commandId
+              },
+              url: tab.url,
+              timestamp: Date.now()
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              type: "event",
+              event: {
+                action: "run_js",
+                code: code,
+                success: false,
+                error: result?.error || 'Unknown error',
+                commandId: msg.commandId
+              },
+              url: tab.url,
+              timestamp: Date.now()
+            }));
+          }
+        } catch (error) {
+          console.error("[AI Bridge] Error executing JS:", error);
+          ws.send(JSON.stringify({
+            type: "event",
+            event: {
+              action: "run_js",
+              commandId: msg.commandId,
+              success: false,
+              error: error.message
+            },
+            url: tab.url,
+            timestamp: Date.now()
+          }));
+        }
+      } else {
+        ws.send(JSON.stringify({
+          type: "event",
+          event: {
+            action: "run_js",
+            commandId: msg.commandId,
+            success: false,
+            error: "No active tab found"
+          },
+          timestamp: Date.now()
+        }));
+      }
+      return; // Don't fall through to the generic execute handler
+    }
+
+    // Execute command in content script (for non-JS actions like click, input, etc.)
     if (msg.type === "execute") {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab) {
-        chrome.tabs.sendMessage(tab.id, msg);
+      if (tab && tab.id) {
+        // Check if it's a restricted URL
+        if (tab.url && (tab.url.startsWith('chrome://') || tab.url.startsWith('edge://') || 
+            tab.url.startsWith('about:') || tab.url.startsWith('chrome-extension://') ||
+            tab.url.startsWith('moz-extension://') || tab.url.startsWith('extension://'))) {
+          ws.send(JSON.stringify({
+            type: "event",
+            event: {
+              action: msg.action,
+              commandId: msg.commandId,
+              success: false,
+              error: `Cannot execute on restricted page: ${tab.url}. Navigate to a regular web page first.`
+            },
+            url: tab.url,
+            timestamp: Date.now()
+          }));
+          return;
+        }
+
+        try {
+          // Try to send message to content script
+          chrome.tabs.sendMessage(tab.id, msg, async (response) => {
+            if (chrome.runtime.lastError) {
+              console.log("[AI Bridge] Content script not available, attempting to inject...");
+              
+              // Try to inject content script
+              try {
+                await chrome.scripting.executeScript({
+                  target: { tabId: tab.id },
+                  files: ['content.js']
+                });
+                console.log("[AI Bridge] Content script injected successfully");
+                
+                // Wait a moment for the script to initialize
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Retry the message
+                chrome.tabs.sendMessage(tab.id, msg, (retryResponse) => {
+                  if (chrome.runtime.lastError) {
+                    console.error("[AI Bridge] Still failed after injection:", chrome.runtime.lastError.message);
+                    ws.send(JSON.stringify({
+                      type: "event",
+                      event: {
+                        action: msg.action,
+                        commandId: msg.commandId,
+                        success: false,
+                        error: `Content script error after injection attempt: ${chrome.runtime.lastError.message}`
+                      },
+                      url: tab.url,
+                      timestamp: Date.now()
+                    }));
+                  }
+                });
+              } catch (injectError) {
+                console.error("[AI Bridge] Failed to inject content script:", injectError);
+                ws.send(JSON.stringify({
+                  type: "event",
+                  event: {
+                    action: msg.action,
+                    commandId: msg.commandId,
+                    success: false,
+                    error: `Failed to inject content script: ${injectError.message}. Make sure you are on a regular web page.`
+                  },
+                  url: tab.url,
+                  timestamp: Date.now()
+                }));
+              }
+            }
+          });
+        } catch (error) {
+          console.error("[AI Bridge] Error executing command:", error);
+          ws.send(JSON.stringify({
+            type: "event",
+            event: {
+              action: msg.action,
+              commandId: msg.commandId,
+              success: false,
+              error: error.message
+            },
+            url: tab?.url,
+            timestamp: Date.now()
+          }));
+        }
+      } else {
+        // No active tab found
+        ws.send(JSON.stringify({
+          type: "event",
+          event: {
+            action: msg.action,
+            commandId: msg.commandId,
+            success: false,
+            error: "No active tab found"
+          },
+          timestamp: Date.now()
+        }));
       }
     }
 
@@ -363,9 +683,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "request_dom") {
-    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, async ([tab]) => {
       if (tab) {
-        chrome.tabs.sendMessage(tab.id, { type: "get_dom" });
+        chrome.tabs.sendMessage(tab.id, { type: "get_dom" }, async (response) => {
+          if (chrome.runtime.lastError) {
+            console.log("[AI Bridge] Content script not available for DOM request, injecting...");
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                files: ['content.js']
+              });
+              await new Promise(resolve => setTimeout(resolve, 100));
+              chrome.tabs.sendMessage(tab.id, { type: "get_dom" });
+            } catch (err) {
+              console.error("[AI Bridge] Failed to inject for DOM request:", err);
+            }
+          }
+        });
       }
     });
     sendResponse({ ok: true });

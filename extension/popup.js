@@ -33,6 +33,13 @@ chrome.runtime.sendMessage({ type: 'get_status' }, (response) => {
   }
 });
 
+// Listen for connection status changes from background script
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'connection_status_changed') {
+    updateStatus(message.connected);
+  }
+});
+
 // Connect button
 connectBtn.addEventListener('click', () => {
   connectBtn.disabled = true;

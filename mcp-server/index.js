@@ -325,12 +325,12 @@ server.tool(
     text: z.string().optional().describe('Text to type (for type action)'),
     code: z.string().optional().describe('JavaScript code to execute (for run_js action)'),
     timeout: z.number().optional().describe('Timeout in ms (default: 5000)'),
-    usePlaywright: z.boolean().optional().describe('Use Playwright directly instead of extension (more reliable)')
+    usePlaywright: z.boolean().optional().describe('Use Playwright directly instead of extension (bypasses CSP, requires launch_browser first)')
   },
   async ({ action, selector, text, code, timeout, usePlaywright }) => {
     try {
-      // Use Playwright directly for click/type if requested or as fallback
-      if (usePlaywright && (action === 'click' || action === 'type')) {
+      // Use Playwright directly if requested
+      if (usePlaywright) {
         const browser = getBrowserManager();
         let result;
         
@@ -338,6 +338,17 @@ server.tool(
           result = await browser.click(selector, timeout || 5000);
         } else if (action === 'type') {
           result = await browser.type(selector, text, timeout || 5000);
+        } else if (action === 'run_js') {
+          // Use Playwright's evaluate which bypasses CSP
+          result = await browser.evaluate(code);
+        } else {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ success: false, error: `Action '${action}' not supported with usePlaywright` }, null, 2)
+            }],
+            isError: true
+          };
         }
         
         return {
@@ -354,6 +365,20 @@ server.tool(
         method: 'POST',
         body: JSON.stringify({ action, selector, text, code, timeout })
       });
+      
+      // If CSP blocked and it's run_js, suggest using Playwright
+      if (!result.success && result.result?.cspBlocked) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ...result,
+              suggestion: 'This site has strict CSP. Use usePlaywright:true with launch_browser, or use get_state to read page content without JS execution.'
+            }, null, 2)
+          }],
+          isError: true
+        };
+      }
       
       return {
         content: [{

@@ -355,6 +355,43 @@ class BrowserManager {
   }
 
   /**
+   * Evaluate JavaScript code in the page context using Playwright
+   * This bypasses CSP restrictions as it uses the browser's debugger protocol
+   * @param {string} code - JavaScript code to evaluate
+   */
+  async evaluate(code) {
+    if (!this.isLaunched || !this.page) {
+      throw new Error('Browser not launched. Use launch_browser first, or usePlaywright only works with Playwright-launched browsers.');
+    }
+
+    try {
+      // Use Playwright's evaluate which uses CDP and bypasses CSP
+      const result = await this.page.evaluate((codeToRun) => {
+        // Execute the code and return the result
+        const fn = new Function('return (' + codeToRun + ')');
+        return fn();
+      }, code);
+
+      // Format result
+      if (result === undefined) {
+        return { success: true, result: 'undefined' };
+      } else if (result === null) {
+        return { success: true, result: 'null' };
+      } else if (typeof result === 'object') {
+        try {
+          return { success: true, result: JSON.stringify(result, null, 2) };
+        } catch (e) {
+          return { success: true, result: String(result) };
+        }
+      } else {
+        return { success: true, result: String(result) };
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
    * Close the browser
    */
   async close() {
