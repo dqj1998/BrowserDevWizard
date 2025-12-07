@@ -1,6 +1,6 @@
 # A test/debug environment for developments on browsers
 
-A system where VSCode + Copilot can observe a live Chrome browser, inspect DOM, capture console logs/screenshots, send automation commands, and modify Chrome Extension code with auto-reload.
+A system where AI LLM can observe a live Chrome browser, inspect DOM, capture console logs/screenshots, send automation commands, and modify Chrome Extension code with auto-reload.
 
 ## Architecture
 
