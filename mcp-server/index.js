@@ -139,6 +139,66 @@ server.tool(
   }
 );
 
+// Tool: connect_browser_by_cdp
+server.tool(
+  'connect_browser_by_cdp',
+  'Connect to a running Chrome browser via Chrome DevTools Protocol (CDP). This bypasses CSP restrictions and allows full JS execution. Chrome must be started with --remote-debugging-port=9222. Use this for sites with strict CSP like Gemini.',
+  {
+    endpointUrl: z.string().optional().describe('CDP endpoint URL (default: http://localhost:9222)'),
+    timeout: z.number().optional().describe('Connection timeout in ms (default: 10000)')
+  },
+  async ({ endpointUrl, timeout }) => {
+    const browser = getBrowserManager();
+    
+    try {
+      const result = await browser.connectCDP({ endpointUrl, timeout });
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            connected: true,
+            method: 'cdp',
+            currentUrl: result.url,
+            currentTitle: result.title,
+            pagesCount: result.pagesCount,
+            message: 'Connected to Chrome via CDP. You can now use execute_action with usePlaywright:true to run JavaScript that bypasses CSP restrictions.',
+            usage: {
+              runJs: 'Use execute_action with action:"run_js", code:"your code", usePlaywright:true',
+              click: 'Use execute_action with action:"click", selector:"...", usePlaywright:true',
+              note: 'The browser will remain open when you call close_browser'
+            }
+          }, null, 2)
+        }]
+      };
+    } catch (error) {
+      const isConnectionError = error.message.includes('ECONNREFUSED') || error.message.includes('connect');
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: error.message,
+            help: isConnectionError ? {
+              message: 'Chrome must be started with remote debugging enabled AND a custom user-data-dir.',
+              commands: {
+                macOS_temp: '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug',
+                macOS_keepLogins: '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir="$HOME/Chrome-Debug-Profile"',
+                windows: 'chrome.exe --remote-debugging-port=9222 --user-data-dir=%TEMP%\\chrome-debug',
+                linux: 'google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug'
+              },
+              note: 'Close ALL Chrome windows first, then run the command. The --user-data-dir flag is required for CDP to work.'
+            } : null
+          }, null, 2)
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
 // Tool: launch_browser
 server.tool(
   'launch_browser',

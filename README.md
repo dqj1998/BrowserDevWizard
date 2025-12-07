@@ -127,6 +127,68 @@ When you modify any file in `/extension/`, the server automatically tells Chrome
         └── events.json
 ```
 
+## Operation Modes
+
+BrowserDevWizard supports two operation modes, each with different trade-offs:
+
+### Mode Comparison
+
+| Feature | **Extension Mode** | **CDP Mode** |
+|---------|-------------------|--------------|
+| **Setup** | Install extension + run debug-server | Start Chrome with `--remote-debugging-port=9222` |
+| **Use existing profile** | ✅ Yes (your normal Chrome with logins) | ⚠️ Needs separate `--user-data-dir` (no shared logins) |
+| **Run JavaScript** | ⚠️ Limited (blocked by strict CSP sites like Gemini, GitHub) | ✅ Yes, anything (full DevTools power) |
+| **DOM operations** | ✅ Click, type, scroll, get_dom | ✅ Everything |
+| **Screenshots** | ✅ Yes | ✅ Yes |
+| **Console logs** | ✅ Yes (captures from page) | ✅ Yes |
+| **Works on any site** | ✅ Yes for DOM ops, ❌ No for JS on strict CSP | ✅ Yes, everything |
+| **Extension required** | ✅ Yes | ❌ No |
+
+### When to Use Which Mode
+
+- **Extension Mode**: Daily browsing/debugging on your normal Chrome with all your logins. Good for DOM operations (click, type, scroll, get_dom, screenshots). JS execution works on most sites but fails on strict CSP sites.
+
+- **CDP Mode**: When you need to run arbitrary JavaScript on strict CSP sites (Gemini, GitHub, Google, etc.), or when you want full DevTools-level control. No extension needed, but requires starting Chrome with special flags.
+
+**Pro tip**: You can use both! Use your normal Chrome with extension for most tasks, and have a separate CDP-enabled Chrome for when you need to run JS on strict sites.
+
+### Extension Mode Setup
+
+See [Setup](#setup) section below.
+
+### CDP Mode Setup
+
+1. **Start Chrome with debugging enabled:**
+
+```bash
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/Chrome-Debug-Profile"
+
+# Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe" ^
+  --remote-debugging-port=9222 ^
+  --user-data-dir="%USERPROFILE%\Chrome-Debug-Profile"
+
+# Linux
+google-chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/Chrome-Debug-Profile"
+```
+
+2. **Connect via MCP tool:**
+
+Use the `connect_browser_by_cdp` tool with endpoint URL `http://localhost:9222`
+
+3. **Execute commands:**
+
+All MCP tools (`navigate`, `execute_action`, `capture_state`, etc.) will work through CDP.
+
+> **Note:** The `--user-data-dir` flag is required for remote debugging. The debug profile won't have your existing logins (Chrome encrypts cookies per-profile), but you can log in manually and those logins will persist in that profile for future use.
+
+---
+
 ## MCP Server (AI Integration)
 
 The MCP server allows VS Code Copilot to control the browser directly through tools.
@@ -148,7 +210,8 @@ npm run server
 
 | Tool | Description |
 |------|-------------|
-| `launch_browser` | Start Chrome with debug extension loaded |
+| `launch_browser` | Start Chrome with debug extension loaded (Extension mode) |
+| `connect_browser_by_cdp` | Connect to running Chrome via CDP (CDP mode) |
 | `navigate` | Go to URL and wait for page load |
 | `capture_state` | Snapshot DOM/screenshot/logs to session folder |
 | `execute_action` | Click, type, run JavaScript, or scroll |

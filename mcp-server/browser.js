@@ -32,6 +32,71 @@ class BrowserManager {
     this.context = null;
     this.page = null;
     this.isLaunched = false;
+    this.isCdpConnected = false;  // Track if connected via CDP
+  }
+
+  /**
+   * Connect to a running Chrome instance via CDP (Chrome DevTools Protocol)
+   * Chrome must be started with --remote-debugging-port=9222
+   * @param {Object} options - Connection options
+   * @param {string} options.endpointUrl - CDP WebSocket endpoint URL (default: http://localhost:9222)
+   * @param {number} options.timeout - Connection timeout in ms (default: 10000)
+   */
+  async connectCDP(options = {}) {
+    const {
+      endpointUrl = 'http://localhost:9222',
+      timeout = 10000
+    } = options;
+
+    if (this.isLaunched) {
+      throw new Error('Browser already connected. Call close() first.');
+    }
+
+    console.log(`🔗 Connecting to Chrome via CDP at ${endpointUrl}...`);
+
+    try {
+      // Connect to the running Chrome instance
+      this.browser = await chromium.connectOverCDP(endpointUrl, { timeout });
+      
+      // Get the default context (the browser's main context)
+      const contexts = this.browser.contexts();
+      if (contexts.length === 0) {
+        throw new Error('No browser contexts found. Make sure Chrome has at least one window open.');
+      }
+      this.context = contexts[0];
+      
+      // Get the first page or create one
+      const pages = this.context.pages();
+      if (pages.length === 0) {
+        throw new Error('No pages found. Make sure Chrome has at least one tab open.');
+      }
+      this.page = pages[0];
+      this.isLaunched = true;
+      this.isCdpConnected = true;
+
+      // Set up handlers
+      this.context.on('close', () => {
+        console.log('Browser context closed');
+        this.isLaunched = false;
+        this.isCdpConnected = false;
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+      });
+
+      console.log('✅ Connected to Chrome via CDP');
+      return { 
+        success: true, 
+        url: this.page.url(),
+        title: await this.page.title(),
+        pagesCount: pages.length
+      };
+    } catch (error) {
+      if (error.message.includes('ECONNREFUSED') || error.message.includes('connect')) {
+        throw new Error(`Cannot connect to Chrome at ${endpointUrl}. Make sure Chrome is running with --remote-debugging-port=9222`);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -392,18 +457,42 @@ class BrowserManager {
   }
 
   /**
-   * Close the browser
+   * Close the browser connection
+   * For CDP connections, this disconnects without closing the browser
+   * For launched browsers, this closes the browser
    */
   async close() {
-    if (this.context) {
+    if (this.isCdpConnected && this.browser) {
+      console.log('👋 Disconnecting from Chrome (browser will remain open)...');
+      // For CDP connections, just disconnect - don't close the browser
+      await this.browser.close();
+      this.browser = null;
+      this.context = null;
+      this.page = null;
+      this.isLaunched = false;
+      this.isCdpConnected = false;
+      return { success: true, message: 'Disconnected from Chrome (browser remains open)' };
+    } else if (this.context) {
       console.log('👋 Closing browser...');
       await this.context.close();
       this.browser = null;
       this.context = null;
       this.page = null;
       this.isLaunched = false;
+      return { success: true, message: 'Browser closed' };
     }
-    return { success: true };
+    return { success: true, message: 'No browser to close' };
+  }
+
+  /**
+   * Get connection info
+   */
+  getConnectionInfo() {
+    return {
+      isLaunched: this.isLaunched,
+      isCdpConnected: this.isCdpConnected,
+      hasPage: !!this.page
+    };
   }
 }
 
