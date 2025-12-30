@@ -245,7 +245,7 @@ npm run server
 }
 ```
 
-2. Start VSCode on the project root: code your?project_folder
+2. Start VSCode on the project root: code your_project_folder
 
 #### Option 2: Global User Settings(!Need more tests)
 
