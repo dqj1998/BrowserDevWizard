@@ -228,7 +228,7 @@ npm run server
 
 #### Option 1: Workspace Config
 
-Copy `.vscode/mcp.json` to your project's `.vscode/` folder with absolute path:
+1. Copy `.vscode/mcp.json` to your project's `.vscode/` folder with absolute path:
 
 ```json
 {
@@ -245,13 +245,15 @@ Copy `.vscode/mcp.json` to your project's `.vscode/` folder with absolute path:
 }
 ```
 
-#### Option 2: Global User Settings
+2. Start VSCode on the project root: code your?project_folder
+
+#### Option 2: Global User Settings(!Need more tests)
 
 Add to VS Code settings.json (`Cmd+,` → "Edit in settings.json"):
 
 ```json
 {
-  "github.copilot.chat.mcp.servers": {
+  "mcpServers": {
     "browser-debug": {
       "type": "stdio",
       "command": "node",
